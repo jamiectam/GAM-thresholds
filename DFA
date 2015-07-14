@@ -1,0 +1,144 @@
+require(MARSS)
+require(reshape2)
+
+cc<-CCIEA.Reference.Points.Workshop.Ecological.Integrity.and.Human.Activities.indicator.time.series
+
+##coastwide data
+ccALL <- cc[cc$Coastwide == 1,]
+
+ccdat<-ccALL[,c("year", "value", "timeseries")]
+
+ts.length<-c(2003:2012)
+
+ccind<-ccdat[ccdat$timeseries %in% c("GF_spp_richness_coastwide", "GF-Simp_coastwide", "GF_MTL_coastwide", "Scav_ratio"),]
+names(ccind)[1]<-paste("YEAR")
+names(ccind)[2]<-paste("VALUE")
+names(ccind)[3]<-paste("INDICATOR")
+indicator<-ccind
+
+ccdri<-ccdat[! ccdat$timeseries %in% c("GF_spp_richness_coastwide", "GF-Simp_coastwide", "GF_MTL_coastwide", "Scav_ratio"),]
+names(ccdri)[1]<-paste("YEAR")
+names(ccdri)[2]<-paste("VALUE")
+names(ccdri)[3]<-paste("DRIVER")
+driver<-ccdri[ccdri$YEAR %in% ts.length,]
+
+df<-driver[,-1]
+
+#turn data.frame into matrix 
+dat<-t(df)
+
+N.ts<-dim(dat)[1]
+
+# get length of time series
+TT<-dim(dat)[2]
+
+# Take the z-scores of data to normalize
+Sigma <- sqrt(apply(dat,1,var,na.rm=TRUE))
+Mean <- apply(dat,1,mean,na.rm=TRUE)
+dat.z <- (dat-Mean)*(1/Sigma)
+rownames(dat.z) <- colnames(df)
+
+
+
+
+##############
+# BASE MODEL #
+##############
+# set new control params
+cntl.list = list(minit=200, maxit=1200, allow.degen=FALSE)
+# set up forms of R matrices
+levels.R = c("diagonal and equal",
+             "diagonal and unequal",
+             "unconstrained")
+model.data = data.frame()
+# r.fit <- data.frame()
+# fit lots of models & store results
+# NOTE: this will take a long time to run!
+for(R in levels.R) {
+ 
+  for(m in 1:(N.ts-1)) {    
+    dfa.model = list(A="zero", R=R, m=m)
+    kemz = MARSS(dat.z, 
+                 model=dfa.model, 
+                 control=cntl.list,
+                 #control=cntl.list,
+                 silent = T,
+                 form="dfa",
+                 z.score=TRUE,
+                  MCInit=TRUE) 
+    model.data = rbind(model.data,
+                       data.frame(R=R,
+                                  m=m,
+                                  logLik=kemz$logLik,
+                                  K=kemz$num.params,
+                                  AICc=kemz$AICc,                                       
+                                  stringsAsFactors=FALSE))
+    r.fit <- rbind(#removed term r.fit here
+      data.frame(mean(diag(coef(kemz, type = "matrix")$R)),
+                 rbind(diag(coef(kemz, type = "matrix")$R))))
+    assign(paste("kemz", m, R, sep="."), kemz)
+    cat("Just finished",m,"hidden trend(s) with a",R,"covariance matrix with no covariate \n") # end m loop
+  } # end m loop
+} # end R loop
+save(file="DFA_driversCC.Rdata",list = c("model.data", ls(pattern="^kemz."))) # end R loop
+
+
+##############################################################
+# Create table of different structures and numbers of trends #
+##############################################################
+# calculate delta-AICc
+model.data$delta.AICc = model.data$AICc - min(model.data$AICc)
+# calculate Akaike weights
+wt = exp(-0.5*model.data$delta.AICc)
+model.data$Ak.wt = wt/sum(wt)
+
+# sort results
+model.tbl = model.data[order(model.data$AICc),-4]
+# drop AICc from table
+# calculate cumulative wts
+model.tbl$Ak.wt.cum = cumsum(model.tbl$Ak.wt)
+model.tbl = model.tbl[,-4]
+
+
+best.model <- model.tbl[1,]
+fitname = paste("kemz",best.model$m,best.model$R,sep=".")
+best.fit = get(fitname)
+
+# rotate factor loadings
+Z.rot = coef(best.fit, type="matrix")$Z %*% H.inv   
+# rotate trends
+trends.rot = solve(H.inv) %*% best.fit$states
+ts.trends = cbind(year, t(trends.rot))
+colnames(ts.trends) <- c("YEAR", "T1", "T2", "T3")
+# colnames(ts.trends) <- c("YEAR", "T1", "T2")
+
+save(driver, indicator, dat, dat.z, ts.trends, file = "dfaTrendsCC_v0001.RDATA")
+write.csv(model.tbl, paste0("dfaResultsCC.csv"), row.names = F)
+
+
+H.inv = varimax(coef(best.fit, type="matrix")$Z)$rotmat
+
+#################
+# Data Analysis #
+#################
+ind.list <- unique(ccind$INDICATOR)
+### INDIVIDUAL GAMS ####
+test <- unique(expand.grid(indicator$INDICATOR, driver$DRIVER[driver$DRIVER != "LANDINGS"],
+                           "LANDINGS"))
+gams.list <- list()
+best.df <- data.frame()
+mod.select <- data.frame()
+for(ti in 1:nrow(test)) {
+  bg.ti <-  test[ti,]
+  bg.x <- subset(driver, DRIVER == "LANDINGS")
+  bg.y<-  subset(driver, DRIVER == bg.ti[,2])
+  bg.z <- subset(indicator, INDICATOR == bg.ti[,1])
+  bg.name <- paste(bg.ti[,1],bg.ti[,2], "L", sep = ".")
+  bg.year <- intersect(intersect(bg.x$YEAR, bg.y$YEAR), intersect(bg.x$YEAR, bg.z$YEAR))
+  bg <- data.frame(x = scale(bg.x$VALUE[bg.x$YEAR %in% bg.year], scale = T, center = T),
+                   y = scale(bg.y$VALUE[bg.y$YEAR %in% bg.year], scale = T, center = T),
+                   z = scale(bg.z$VALUE[bg.z$YEAR %in% bg.year], scale = T, center = T))
+  if(length(bg$x) == length(bg$y)) {
+    mat.len <- length(bg$x)
+  } else stop("X and Y must be the same length")
+  
